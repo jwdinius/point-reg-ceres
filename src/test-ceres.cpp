@@ -2,8 +2,10 @@
 #include <string>
 #include <iostream>
 #include <fstream>
+#include <limits>
 #include <streambuf>
 #include <set>
+#include <utility>
 //! dependency headers
 #include <Eigen/Dense>
 #include <nlohmann/json.hpp>
@@ -22,7 +24,8 @@ struct Config {
 
 using correspondences_t = std::set<size_t>;
 
-double consistency(Eigen::Vector3d const & si, Eigen::Vector3d const & tj, Eigen::Vector3d const & sk, Eigen::Vector3d const & tl) noexcept {
+double consistency(Eigen::Vector3d const & si, Eigen::Vector3d const & tj,
+    Eigen::Vector3d const & sk, Eigen::Vector3d const & tl) noexcept {
   Eigen::Vector3d const si_to_sk = si - sk;
   Eigen::Vector3d const tj_to_tl = tj - tl;
   return std::abs(si_to_sk.norm() - tj_to_tl.norm());
@@ -31,7 +34,7 @@ double consistency(Eigen::Vector3d const & si, Eigen::Vector3d const & tj, Eigen
 Eigen::MatrixXd generate_weight_tensor(Eigen::MatrixXd const & source_pts,
     Eigen::MatrixXd const & target_pts, Config const & config) noexcept {
   int const N = source_pts.cols();  // TODO(jwd) - make check that source and target are same size
-  Eigen::MatrixXd weights = Eigen::MatrixXd::Zero(N*N, N*N);
+  Eigen::MatrixXd weights = Eigen::MatrixXd::Zero((N+1)*N, (N+1)*N);
   auto const & eps = config.epsilon;
   auto const & pw_thresh = config.pairwise_dist_threshold;
   for (auto i = 0; i < N; ++i) {
@@ -45,7 +48,7 @@ Eigen::MatrixXd generate_weight_tensor(Eigen::MatrixXd const & source_pts,
             Eigen::Vector3d const tl = target_pts.col(l);
             double const c = consistency(si, tj, sk, tl);
             if (c < eps && (si - sk).norm() > pw_thresh) {
-              weights(i*N+j, k*N+l) = -std::exp(-c);
+              weights(i*N+j, k*N+l) = std::exp(-c);
             }
           }
         }
@@ -54,15 +57,19 @@ Eigen::MatrixXd generate_weight_tensor(Eigen::MatrixXd const & source_pts,
   }
   return weights;
 }
-/*
+
 struct CostFunctor {
-  CostFunctor() { }
-  template<typename T>
-  bool operator(const T* const x, T* res) const {
-    
-    res[0] = std::sqrt();
+  explicit CostFunctor(Eigen::MatrixXd const U) : U_(U) { }
+  bool operator()(double const* const* x, double* res) const {
+    const double *x_deref = x[0];
+    Eigen::Map<const Eigen::VectorXd> vec_x(x_deref, U_.cols() /* = U_.rows() */);
+    Eigen::VectorXd weighted_vec_x = U_ * vec_x;
+    res[0] = weighted_vec_x.norm();
+    return true;
   }
-};*/
+
+  Eigen::MatrixXd U_;
+};
 
 int main() {
   //! load unit test data from json
@@ -115,15 +122,52 @@ int main() {
   //! SETUP THE CERES PROBLEM HERE!!
   //! first, build weighting matrix A and then take Chol decomp
   Eigen::MatrixXd A = generate_weight_tensor(src_pts, tgt_pts, config);
-  //! compute Cholesky decomp: A = L*L.transpose() 
+  //! compute Cholesky decomp: A = U.transpose() * U
   Eigen::LDLT<Eigen::MatrixXd> ldlt;
   ldlt.compute(A);
-  Eigen::MatrixXd L = ldlt.matrixL();
-  //! what we want is A = U.transpose() * U, for efficient norm calculation
-  //! e.g. U = L.transpose()
-  Eigen::MatrixXd U = L.transpose();
-  // pass U as arg to cost function
-  //ceres::Problem problem;
-  //ceres::CostFunction* cost_fcn = AutoDiffCostFunction<CostFunctor, 
+  Eigen::MatrixXd U = ldlt.matrixU();
+  CostFunctor *C = new CostFunctor(U);
+
+  //! TEST 1: make sure that CostFunctor::operator() overload works correctly
+  Eigen::VectorXd v(U.rows());
+  v.setRandom();
+  double res[1];
+  const double *vec_ptr = &v(0);
+  (*C)(&vec_ptr, res);
+  bool test_pass = res[0] - (U*v).norm() < std::numeric_limits<double>::epsilon();
+  if (test_pass) {
+    std::cout << "Overload test passed!!" << std::endl;
+  } else {
+    std::cout << "Overload test failed!!" << std::endl;
+  }
+  
+  ceres::Problem problem;
+  auto const & N = cols_S; /* == cols_T */
+  double x[(N+1)*N];
+
+  ceres::DynamicNumericDiffCostFunction<CostFunctor> *cost_fcn = new ceres::DynamicNumericDiffCostFunction<CostFunctor>(new CostFunctor(std::move(U)));
+  cost_fcn->AddParameterBlock((N+1)*N);
+  cost_fcn->SetNumResiduals(1);
+  problem.AddResidualBlock(cost_fcn, nullptr /* use squared loss */, x);
+  for (size_t i = 0; i < (N+1)*N; ++i) {
+    problem.SetParameterLowerBound(x, i, 0.0);
+    problem.SetParameterUpperBound(x, i, 1.0);
+  }
+
+  // TODO(jwd) - add residual blocks to make soft constraints out of hard constraints
+  // problem.AddResidualBlock(...) for sum over i = 1
+  // problem.AddResidualBlock(...) for sum over j = 1
+  // problem.AddResidualBlock(...) for sum over i=N+1 = N-m (m is desired number of correspondences)
+  //! now solve it!!
+  ceres::Solver::Options opt;
+  opt.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+  opt.minimizer_progress_to_stdout = true;
+
+  ceres::Solver::Summary summ;
+  ceres::Solve(opt, &problem, &summ);
+  std::cout << summ.FullReport() << std::endl;
+  
+  //! cleanup
+  delete C;
   return 0;
 }
